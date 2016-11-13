@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	//"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/rwcarlsen/goexif/exif"
+	"github.com/rwcarlsen/goexif/tiff"
 	"gopkg.in/redis.v5"
 )
 
@@ -22,65 +21,94 @@ var client = redis.NewClient(&redis.Options{
 	DB:       0,  // use default DB
 })
 
+type s3Photo struct {
+	key    string
+	bucket string
+}
+
+type loaddedS3Photo struct {
+	s3Photo
+	data []byte
+}
+
+type s3PhotoWithExif struct {
+	s3Photo
+	exif map[string]string
+}
+
+func (photo *s3PhotoWithExif) Walk(name exif.FieldName, tag *tiff.Tag) error {
+	photo.exif[string(name)] = tag.String()
+	return nil
+}
+
+func getBucketFiles(bucket string, session *session.Session) ([]s3Photo, error) {
+	var allPhotos []s3Photo
+	s3Client := s3.New(session)
+	params := &s3.ListObjectsInput{
+		Bucket: aws.String(bucket),
+	}
+	resp, err := s3Client.ListObjects(params)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range resp.Contents {
+		allPhotos = append(allPhotos, s3Photo{*key.Key, bucket})
+	}
+	return allPhotos, nil
+}
+
+func downloadPhoto(photo s3Photo, session *session.Session) (*loaddedS3Photo, error) {
+	manager := s3manager.NewDownloader(session, func(d *s3manager.Downloader) {
+		d.PartSize = 1 * 1024 * 1024 // 64MB per part
+	})
+	hehe := s3.GetObjectInput{
+		Key:    &photo.key,
+		Bucket: aws.String(photo.bucket),
+	}
+	writer := aws.WriteAtBuffer{}
+	_, err := manager.Download(&writer, &hehe)
+	if err != nil {
+		return nil, err
+	}
+	return &loaddedS3Photo{photo, writer.Bytes()}, nil
+}
+
+func getExif(photo *loaddedS3Photo) (*s3PhotoWithExif, error) {
+	r := bytes.NewReader(photo.data)
+	x, err := exif.Decode(r)
+	if err != nil {
+		return nil, err
+	}
+	data := &s3PhotoWithExif{photo.s3Photo, make(map[string]string)}
+	err = x.Walk(data)
+	return data, err
+}
+
 func main() {
 	session := session.New(&aws.Config{
 		Credentials: credentials.AnonymousCredentials,
 		Region:      aws.String("us-east-1"),
-		// LogLevel:    aws.LogLevel(aws.LogDebug),
+		LogLevel:    aws.LogLevel(aws.LogDebug),
 	})
-	sess := s3.New(session)
-
-	params := &s3.ListObjectsInput{
-		Bucket: aws.String("waldo-recruiting"),
-	}
-	//
-
-	resp, err := sess.ListObjects(params)
+	allPhotos, err := getBucketFiles("waldo-recruiting", session)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err)
 	}
 
-	var allPhotos []string
-
-	//log.Println(resp.String())
-	for _, key := range resp.Contents {
-		allPhotos = append(allPhotos, *key.Key)
-	}
-
-	// log.Println(allPhotos)
-	// Set up a new s3manager client
-
-	manager := s3manager.NewDownloader(session, func(d *s3manager.Downloader) {
-		d.PartSize = 1 * 1024 * 1024 // 64MB per part
-	})
-	buff := make([]byte, 10000000, 10000000)
-	for _, key := range allPhotos {
-		log.Println(key)
-
-		hehe := s3.GetObjectInput{
-			Key:    &key,
-			Bucket: aws.String("waldo-recruiting"),
-		}
-
-		writer := aws.NewWriteAtBuffer(buff)
-		l, err := manager.Download(writer, &hehe)
+	for _, photo := range allPhotos {
+		downloadedPhoto, err := downloadPhoto(photo, session)
 		if err != nil {
 			fmt.Println(err)
-			os.Exit(1)
+			continue
 		}
-		buff = writer.Bytes()
-		log.Printf("%d - %d\n", l, len(buff))
-		r := bytes.NewReader(buff)
-
-		x, err := exif.Decode(r)
+		photoExif, err := getExif(downloadedPhoto)
 		if err != nil {
-			log.Fatal("exif decode " + err.Error())
-		} else {
-			err := client.Set(key, x.String(), 0)
-			if err != nil {
-				log.Fatal("redis error " + err.Err().Error())
-			}
+			fmt.Println(err)
+			continue
+		}
+		err = client.HMSet(photoExif.key, photoExif.exif).Err()
+		if err != nil {
+			log.Fatal("redis error " + err.Error())
 		}
 	}
 

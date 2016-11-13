@@ -24,6 +24,68 @@ import (
 	"github.com/rwcarlsen/goexif/tiff"
 )
 
+func main() {
+	start := time.Now()
+	parrLevel := flag.Int("parrLevel", 10, "download concurrency level")
+	bucketURL := flag.String("bucket-url", "https://waldo-recruiting.s3.amazonaws.com", "bucket url")
+	redisAddr := flag.String("redis", "localhost:6379", "redis address")
+	flag.Parse()
+	log.Printf("parrLevel = %d\n", *parrLevel)
+	log.Println("bucketURL = " + *bucketURL)
+	log.Println("redisAddr = " + *redisAddr)
+	bucket, region, err := getBucketData(*bucketURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println(bucket, region)
+
+	session := session.New(&aws.Config{
+		Credentials: credentials.AnonymousCredentials,
+		Region:      aws.String(region),
+		LogLevel:    aws.LogLevel(aws.LogOff),
+	})
+	allPhotos, err := getBucketFiles(bucket, session)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var client = redis.NewClient(&redis.Options{
+		Addr:     *redisAddr,
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+	results := make(chan *loaddedS3Photo)
+	concurrencyLevel := make(semaphore, *parrLevel)
+	for _, photo := range allPhotos {
+		photo := photo
+		go func() {
+			concurrencyLevel.acquire()
+			results <- downloadFast(photo, session)
+			concurrencyLevel.release()
+		}()
+	}
+	for _ = range allPhotos {
+		downloadedPhoto := <-results
+		key := fmt.Sprintf("%s:%s", downloadedPhoto.s3Photo.bucket, downloadedPhoto.key)
+		if downloadedPhoto.err != nil {
+			log.Printf("%s - download error: %s", key, downloadedPhoto.err.Error())
+			continue
+		}
+		photoExif, err := getExif(downloadedPhoto)
+		if err != nil {
+			log.Printf("%s - exif error: %s", key, err.Error())
+			continue
+		}
+		err = client.HMSet(key, photoExif.exif).Err()
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		log.Printf("%s - stored to db", key)
+	}
+	elapsed := time.Since(start)
+	log.Printf("Execution took %s", elapsed)
+
+}
+
 type empty struct{}
 type semaphore chan empty
 
@@ -138,65 +200,4 @@ func getBucketData(bucketURL string) (string, string, error) {
 	bucket := strings.Split(u.Host, ".")[0]
 	region := resp.Header.Get("x-amz-bucket-region")
 	return bucket, region, nil
-}
-func main() {
-	start := time.Now()
-	parrLevel := flag.Int("parrLevel", 10, "download concurrency level")
-	bucketURL := flag.String("bucket-url", "https://waldo-recruiting.s3.amazonaws.com", "bucket url")
-	redisAddr := flag.String("redis", "localhost:6379", "redis address")
-	flag.Parse()
-	log.Printf("parrLevel = %d\n", *parrLevel)
-	log.Println("bucketURL = " + *bucketURL)
-	log.Println("redisAddr = " + *redisAddr)
-	bucket, region, err := getBucketData(*bucketURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println(bucket, region)
-
-	session := session.New(&aws.Config{
-		Credentials: credentials.AnonymousCredentials,
-		Region:      aws.String(region),
-		LogLevel:    aws.LogLevel(aws.LogOff),
-	})
-	allPhotos, err := getBucketFiles(bucket, session)
-	if err != nil {
-		log.Fatal(err)
-	}
-	var client = redis.NewClient(&redis.Options{
-		Addr:     *redisAddr,
-		Password: "", // no password set
-		DB:       0,  // use default DB
-	})
-	results := make(chan *loaddedS3Photo)
-	concurrencyLevel := make(semaphore, *parrLevel)
-	for _, photo := range allPhotos {
-		photo := photo
-		go func() {
-			concurrencyLevel.acquire()
-			results <- downloadFast(photo, session)
-			concurrencyLevel.release()
-		}()
-	}
-	for _ = range allPhotos {
-		downloadedPhoto := <-results
-		key := fmt.Sprintf("%s:%s", downloadedPhoto.s3Photo.bucket, downloadedPhoto.key)
-		if downloadedPhoto.err != nil {
-			log.Printf("%s - download error: %s", key, downloadedPhoto.err.Error())
-			continue
-		}
-		photoExif, err := getExif(downloadedPhoto)
-		if err != nil {
-			log.Printf("%s - exif error: %s", key, err.Error())
-			continue
-		}
-		err = client.HMSet(key, photoExif.exif).Err()
-		if err != nil {
-			log.Fatal(err.Error())
-		}
-		log.Printf("%s - stored to db", key)
-	}
-	elapsed := time.Since(start)
-	log.Printf("Execution took %s", elapsed)
-
 }

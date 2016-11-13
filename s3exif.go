@@ -20,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/tiff"
 )
@@ -99,22 +98,22 @@ func downloadFast(photo s3Photo, session *session.Session) *loaddedS3Photo {
 	return &loaddedS3Photo{photo, b.Bytes(), nil}
 }
 
-func downloadPhoto(photo s3Photo, session *session.Session) *loaddedS3Photo {
-	manager := s3manager.NewDownloader(session, func(d *s3manager.Downloader) {
-		d.PartSize = 1 * 1024 * 1024 * 5
-		d.Concurrency = 1
-	})
-	hehe := s3.GetObjectInput{
-		Key:    &photo.key,
-		Bucket: aws.String(photo.bucket),
-	}
-	writer := aws.WriteAtBuffer{}
-	_, err := manager.Download(&writer, &hehe)
-	if err != nil {
-		return &loaddedS3Photo{photo, nil, err}
-	}
-	return &loaddedS3Photo{photo, writer.Bytes(), nil}
-}
+// func downloadPhoto(photo s3Photo, session *session.Session) *loaddedS3Photo {
+// 	manager := s3manager.NewDownloader(session, func(d *s3manager.Downloader) {
+// 		d.PartSize = 1 * 1024 * 1024 * 5
+// 		d.Concurrency = 1
+// 	})
+// 	hehe := s3.GetObjectInput{
+// 		Key:    &photo.key,
+// 		Bucket: aws.String(photo.bucket),
+// 	}
+// 	writer := aws.WriteAtBuffer{}
+// 	_, err := manager.Download(&writer, &hehe)
+// 	if err != nil {
+// 		return &loaddedS3Photo{photo, nil, err}
+// 	}
+// 	return &loaddedS3Photo{photo, writer.Bytes(), nil}
+// }
 
 func getExif(photo *loaddedS3Photo) (*s3PhotoWithExif, error) {
 	r := bytes.NewReader(photo.data)

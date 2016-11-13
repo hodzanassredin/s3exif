@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"strings"
+	"time"
 
 	"gopkg.in/redis.v5"
 
@@ -70,9 +73,36 @@ func getBucketFiles(bucket string, session *session.Session) ([]s3Photo, error) 
 	return allPhotos, nil
 }
 
+func downloadFast(photo s3Photo, session *session.Session) *loaddedS3Photo {
+	rng := fmt.Sprintf("bytes=%d-%d", 0, 1024*100)
+	in := &s3.GetObjectInput{
+		Key:    &photo.key,
+		Bucket: aws.String(photo.bucket),
+		Range:  &rng,
+	}
+	svc := s3.New(session)
+	req, resp := svc.GetObjectRequest(in)
+	err := req.Send()
+	if err != nil {
+		return &loaddedS3Photo{photo, nil, err}
+	}
+	var b bytes.Buffer
+	wr := bufio.NewWriter(&b)
+	_, err = io.Copy(wr, resp.Body)
+	if err != nil {
+		return &loaddedS3Photo{photo, nil, err}
+	}
+	err = wr.Flush()
+	if err != nil {
+		return &loaddedS3Photo{photo, nil, err}
+	}
+	return &loaddedS3Photo{photo, b.Bytes(), nil}
+}
+
 func downloadPhoto(photo s3Photo, session *session.Session) *loaddedS3Photo {
 	manager := s3manager.NewDownloader(session, func(d *s3manager.Downloader) {
-		d.PartSize = 1 * 1024 * 1024 // 64MB per part
+		d.PartSize = 1 * 1024 * 1024 * 5
+		d.Concurrency = 1
 	})
 	hehe := s3.GetObjectInput{
 		Key:    &photo.key,
@@ -111,10 +141,14 @@ func getBucketData(bucketURL string) (string, string, error) {
 	return bucket, region, nil
 }
 func main() {
-	parrLevel := flag.Int("parrLevel", 10, "use it to limit download concurrency level")
-	bucketURL := flag.String("bucket-url", "https://waldo-recruiting.s3.amazonaws.com", "set it to a bucket url")
-	redisAddr := flag.String("redis", "localhost:6379", "set it to redis address")
+	start := time.Now()
+	parrLevel := flag.Int("parrLevel", 10, "download concurrency level")
+	bucketURL := flag.String("bucket-url", "https://waldo-recruiting.s3.amazonaws.com", "bucket url")
+	redisAddr := flag.String("redis", "localhost:6379", "redis address")
 	flag.Parse()
+	log.Printf("parrLevel = %d\n", *parrLevel)
+	log.Println("bucketURL = " + *bucketURL)
+	log.Println("redisAddr = " + *redisAddr)
 	bucket, region, err := getBucketData(*bucketURL)
 	if err != nil {
 		log.Fatal(err)
@@ -141,7 +175,7 @@ func main() {
 		photo := photo
 		go func() {
 			concurrencyLevel.acquire()
-			results <- downloadPhoto(photo, session)
+			results <- downloadFast(photo, session)
 			concurrencyLevel.release()
 		}()
 	}
@@ -163,5 +197,7 @@ func main() {
 		}
 		log.Printf("%s - stored to db", key)
 	}
+	elapsed := time.Since(start)
+	log.Printf("Execution took %s", elapsed)
 
 }

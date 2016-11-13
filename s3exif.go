@@ -4,6 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"net/url"
+	"strings"
+
+	"gopkg.in/redis.v5"
+
+	"net/http"
+
+	"flag"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -12,14 +20,18 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/tiff"
-	"gopkg.in/redis.v5"
 )
 
-var client = redis.NewClient(&redis.Options{
-	Addr:     "localhost:6379",
-	Password: "", // no password set
-	DB:       0,  // use default DB
-})
+type empty struct{}
+type semaphore chan empty
+
+func (s semaphore) acquire() {
+	s <- empty{}
+}
+
+func (s semaphore) release() {
+	<-s
+}
 
 type s3Photo struct {
 	key    string
@@ -29,6 +41,7 @@ type s3Photo struct {
 type loaddedS3Photo struct {
 	s3Photo
 	data []byte
+	err  error
 }
 
 type s3PhotoWithExif struct {
@@ -57,7 +70,7 @@ func getBucketFiles(bucket string, session *session.Session) ([]s3Photo, error) 
 	return allPhotos, nil
 }
 
-func downloadPhoto(photo s3Photo, session *session.Session) (*loaddedS3Photo, error) {
+func downloadPhoto(photo s3Photo, session *session.Session) *loaddedS3Photo {
 	manager := s3manager.NewDownloader(session, func(d *s3manager.Downloader) {
 		d.PartSize = 1 * 1024 * 1024 // 64MB per part
 	})
@@ -68,9 +81,9 @@ func downloadPhoto(photo s3Photo, session *session.Session) (*loaddedS3Photo, er
 	writer := aws.WriteAtBuffer{}
 	_, err := manager.Download(&writer, &hehe)
 	if err != nil {
-		return nil, err
+		return &loaddedS3Photo{photo, nil, err}
 	}
-	return &loaddedS3Photo{photo, writer.Bytes()}, nil
+	return &loaddedS3Photo{photo, writer.Bytes(), nil}
 }
 
 func getExif(photo *loaddedS3Photo) (*s3PhotoWithExif, error) {
@@ -84,32 +97,71 @@ func getExif(photo *loaddedS3Photo) (*s3PhotoWithExif, error) {
 	return data, err
 }
 
+func getBucketData(bucketURL string) (string, string, error) {
+	u, err := url.Parse(bucketURL)
+	if err != nil {
+		return "", "", err
+	}
+	resp, err := http.Head(bucketURL)
+	if err != nil {
+		return "", "", err
+	}
+	bucket := strings.Split(u.Host, ".")[0]
+	region := resp.Header.Get("x-amz-bucket-region")
+	return bucket, region, nil
+}
 func main() {
-	session := session.New(&aws.Config{
-		Credentials: credentials.AnonymousCredentials,
-		Region:      aws.String("us-east-1"),
-		LogLevel:    aws.LogLevel(aws.LogDebug),
-	})
-	allPhotos, err := getBucketFiles("waldo-recruiting", session)
+	parrLevel := flag.Int("parrLevel", 10, "use it to limit download concurrency level")
+	bucketURL := flag.String("bucket-url", "https://waldo-recruiting.s3.amazonaws.com", "set it to a bucket url")
+	redisAddr := flag.String("redis", "localhost:6379", "set it to redis address")
+	flag.Parse()
+	bucket, region, err := getBucketData(*bucketURL)
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Println(bucket, region)
 
+	session := session.New(&aws.Config{
+		Credentials: credentials.AnonymousCredentials,
+		Region:      aws.String(region),
+		LogLevel:    aws.LogLevel(aws.LogOff),
+	})
+	allPhotos, err := getBucketFiles(bucket, session)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var client = redis.NewClient(&redis.Options{
+		Addr:     *redisAddr,
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+	results := make(chan *loaddedS3Photo)
+	concurrencyLevel := make(semaphore, *parrLevel)
 	for _, photo := range allPhotos {
-		downloadedPhoto, err := downloadPhoto(photo, session)
-		if err != nil {
-			fmt.Println(err)
+		photo := photo
+		go func() {
+			concurrencyLevel.acquire()
+			results <- downloadPhoto(photo, session)
+			concurrencyLevel.release()
+		}()
+	}
+	for _ = range allPhotos {
+		downloadedPhoto := <-results
+		key := fmt.Sprintf("%s:%s", downloadedPhoto.s3Photo.bucket, downloadedPhoto.key)
+		if downloadedPhoto.err != nil {
+			log.Printf("%s - download error: %s", key, downloadedPhoto.err.Error())
 			continue
 		}
 		photoExif, err := getExif(downloadedPhoto)
 		if err != nil {
-			fmt.Println(err)
+			log.Printf("%s - exif error: %s", key, err.Error())
 			continue
 		}
-		err = client.HMSet(photoExif.key, photoExif.exif).Err()
+		err = client.HMSet(key, photoExif.exif).Err()
 		if err != nil {
-			log.Fatal("redis error " + err.Error())
+			log.Fatal(err.Error())
 		}
+		log.Printf("%s - stored to db", key)
 	}
 
 }
